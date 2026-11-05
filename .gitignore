@@ -1,0 +1,19 @@
+# --- 密钥与用户数据（绝不入库）---
+data/
+
+# --- 运行产物 / 输出 / 日志 ---
+outputs/
+*.log
+
+# --- Python 缓存 ---
+__pycache__/
+*.pyc
+
+# --- 历史备份快照（Git 提供版本历史，无需重复存档）---
+backups/
+*.bak
+*.bak.*
+*.patch_apply_backup_*
+*.before_*
+*.longvideo_storyboard_*
+*.merge_idempotency_*
