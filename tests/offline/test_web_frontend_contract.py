@@ -203,6 +203,104 @@ class TestFrontendContract(unittest.TestCase):
         """On automatic refresh failure, the timer must be rescheduled with backoff delay."""
         self.assertIn('if(!manual){clearTimeout(timer);timer=null;timer=setTimeout(function(){refresh(false)},_pollDelay)}', INDEX)
 
+    # ------------------------------------------------------------------
+    # Signed playback / download (disposition) contract
+    # ------------------------------------------------------------------
+    def test_fetchplaylink_supports_disposition_param(self):
+        """fetchPlaylink must accept a disposition argument and whitelist it
+        so only 'attachment' is explicitly passable; anything else (including
+        omitted/undefined) falls back to the default inline mode."""
+        self.assertIn(
+            'async function fetchPlaylink(jid,disposition){let disp=disposition==="attachment"?"attachment":"inline";',
+            INDEX,
+        )
+        # The URL passed to the signed /playlink route must carry the chosen
+        # disposition so the server binds it into the HMAC signature.
+        self.assertIn(
+            '"/api/jobs/"+encodeURIComponent(jid)+"/playlink?disposition="+disp',
+            INDEX,
+        )
+
+    def test_player_path_uses_default_inline_fetch(self):
+        """The <video> player's first load and its renewal/re-sign calls must
+        invoke fetchPlaylink without an explicit attachment argument so the
+        player always gets an inline disposition."""
+        # applyPlaylink's initial fetch is the player entry point.
+        self.assertIn('async function applyPlaylink(videoEl,jid){let pl=await fetchPlaylink(jid);', INDEX)
+        # The renewal timer callback and the one-shot error re-sign both use
+        # the no-arg (inline) fetchPlaylink; neither should pass "attachment".
+        self.assertNotIn('fetchPlaylink(videoEl,jid,"attachment")', INDEX)
+
+    def test_download_anchor_requests_attachment_signed_url(self):
+        """The "下载合并视频" click handler must fetch a fresh signed URL with
+        disposition=attachment on every click (not a static /api/download
+        link) and trigger the download from that freshly fetched URL."""
+        # A fresh attachment URL is fetched on each click…
+        self.assertIn('let pl=await fetchPlaylink(current,"attachment");', INDEX)
+        # …and the real download is driven by that returned signed URL on a
+        # transient anchor, never by re-clicking the persistent dl handler.
+        self.assertIn('a.href=pl.url;', INDEX)
+        self.assertIn('a.click();', INDEX)
+        # The persistent handler must not recursively call dl.click().
+        self.assertNotIn('dl.href=pl.url;dl.click()', INDEX)
+
+    def test_download_anchor_handler_is_persistent_and_busy_guarded(self):
+        """The click handler must never be permanently removed (the old
+        dl.onclick=null pattern), must guard against concurrent in-flight
+        requests with a busy flag, and must release that flag (via finally)
+        so the button stays retryable after a failure or a success."""
+        # No permanent removal of the handler.
+        self.assertNotIn('dl.onclick=null', INDEX)
+        # Busy guard: an in-flight request blocks a second one.
+        self.assertIn('if(dl._busy)return;dl._busy=true;', INDEX)
+        # The flag is always released, on both success and failure paths.
+        self.assertIn('finally{dl._busy=false}', INDEX)
+
+    def test_download_anchor_no_longer_static_api_download(self):
+        """The merged-video download anchor must not point at a static,
+        unsigned /api/download/<basename> href anymore."""
+        self.assertNotIn('dl.href="/api/download/"', INDEX)
+
+    def test_no_bearer_or_token_concatenated_into_urls(self):
+        """No URL built in index.html may embed a Bearer token, the
+        Authorization header value, or any API key material.  The only
+        places those strings may appear are the api() helper (which sets the
+        Authorization request header, not a URL) and the settings panel."""
+        # The studio token is read and placed into the Authorization request
+        # header only — it must not be concatenated into any URL literal.
+        self.assertIn('headers["Authorization"]="Bearer "+t', INDEX)
+        # No query-param style token injection into a URL.
+        for bad in ('?token=', '&token=', '?sig_token=', '&bearer='):
+            self.assertNotIn(bad, INDEX)
+        # No Bearer literal concatenated with a "/"-prefixed path (i.e. a URL).
+        self.assertNotIn('Bearer "+"/', INDEX)
+        # The upstream key env var may only appear as static settings-panel
+        # copy (the input label), never concatenated into a URL expression.
+        self.assertIn('网站访问令牌（AGNES_API_TOKEN）', INDEX)
+        self.assertNotIn('AGNES_API_TOKEN+"', INDEX)
+        # The token getter is never concatenated into a URL string.
+        self.assertNotIn('getStudioToken()+"', INDEX)
+
+    def test_download_anchor_shows_visible_error_on_failure(self):
+        """If fetching the signed download URL fails, the user must see a
+        visible notice that explicitly invites a retry, and the busy flag
+        must be released so the button is clickable again."""
+        self.assertIn(
+            'catch(err){notice("下载链接获取失败："',
+            INDEX,
+        )
+        # The failure message surfaces the error reason, the two preconditions,
+        # and an explicit retry hint.
+        self.assertIn(
+            '(err.message||"未知错误")+"（需已保存网站访问令牌，且服务端已配置 AGNES_PLAY_SECRET；可再次点击下载重试）"',
+            INDEX,
+        )
+        # notice() is called with the error=true flag so it renders as an error.
+        self.assertIn(',true)', INDEX)
+        # The busy flag is released in a finally block, keeping the button
+        # retryable after a failure.
+        self.assertIn('finally{dl._busy=false}', INDEX)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

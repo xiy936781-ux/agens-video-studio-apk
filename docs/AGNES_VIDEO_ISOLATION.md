@@ -25,7 +25,7 @@
 | 资源 | 路径 / 值 | 权限 | 说明 |
 |---|---|---|---|
 | 远端代码目录 | `/opt/agnes-video/` | 755 root:root | 含 `server.py` 和 `index.html` |
-| 远端环境变量 | `/etc/agnes-video/agnestudio.env` | 600 root:root | 含 `AGNES_API_TOKEN` 等，不在此记录内容 |
+| 远端环境变量 | `/etc/agnes-video/agnestudio.env` | 600 root:root | 含 `AGNES_API_TOKEN` 等，不在此记录内容；`AGNES_PLAY_SECRET`（可选，签名播放/下载）是否已配置**待远端核对** |
 | 远端数据目录 | `/var/lib/agnes-video/data/` | 700 agnestudio:agnestudio | 含 `config.json`（上游 API Key） |
 | 远端任务目录 | `/var/lib/agnes-video/outputs/` | 700 agnestudio:agnestudio | 视频任务输出 |
 | 远端服务 | `agnestudio.service` | systemd | 运行用户：`agnestudio`，监听 `127.0.0.1:8090` |

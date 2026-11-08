@@ -390,32 +390,213 @@ class SegmentCacheTests(unittest.TestCase):
         dest.parent.mkdir(parents=True, exist_ok=True)
         part = dest.with_suffix(".part")
 
-        class _FakeResponse:
-            """One-shot response that yields a single 11-byte chunk."""
-            def __init__(self, payload):
-                self._payload = payload
-                self._offset = 0
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                return False
-
-            def read(self, size):
-                chunk = self._payload[self._offset:self._offset + size]
-                self._offset += len(chunk)
-                return chunk
-
-        fake_urlopen = MagicMock(return_value=_FakeResponse(b"x" * 11))
-        with patch.object(SERVER.urllib.request, "urlopen", fake_urlopen):
+        # Production now uses build_opener(_NoRedirectHandler()).open(req),
+        # so we mock build_opener to return a fake opener whose .open()
+        # yields the _FakeResponse directly (no real network).
+        fake_open = MagicMock(return_value=_FakeResponse(b"x" * 11))
+        fake_opener = MagicMock()
+        fake_opener.open = fake_open
+        fake_build_opener = MagicMock(return_value=fake_opener)
+        with patch.object(SERVER.urllib.request, "build_opener", fake_build_opener):
             result = SERVER.download_segment_limited(ALLOWED_URL, dest, max_bytes=10)
 
         self.assertEqual(result, {"ok": False, "error": "download exceeds max size"})
         self.assertFalse(part.exists(), ".part file should be cleaned up by production function")
         self.assertFalse(dest.exists(), "final cache file must not be created when download exceeds limit")
-        # The mocked urlopen was invoked exactly once for the single attempt.
-        self.assertEqual(fake_urlopen.call_count, 1)
+        # The mocked build_opener was invoked exactly once with _NoRedirectHandler.
+        self.assertEqual(fake_build_opener.call_count, 1)
+        self.assertTrue(
+            isinstance(fake_build_opener.call_args[0][0], SERVER._NoRedirectHandler),
+            "build_opener must be called with _NoRedirectHandler instance",
+        )
+
+    # ------------------------------------------------------------------ P1: redirect SSRF regression
+    # R1-R6: verify _NoRedirectHandler blocks 301/302/303/307/308 and that
+    # download_segment_limited returns ok=False with "redirect not allowed"
+    # when the upstream issues any redirect, without connecting to the
+    # redirect target.  All network I/O is mocked; no real sockets.
+
+    def _run_redirect_scenario(self, redirect_status, redirect_location, dest):
+        """Run download_segment_limited with a fake opener that simulates
+        the upstream returning ``redirect_status`` with a Location header,
+        then the real _NoRedirectHandler rejects the redirect.
+
+        Returns (result, part_exists, dest_exists, second_hop_called).
+        """
+        second_hop = {"called": False}
+
+        def _fake_open(req, timeout=None):
+            # Simulate: first hop returns a redirect.
+            # The real _NoRedirectHandler.http_error_30x would be invoked
+            # by urllib's handler chain.  We replicate that call directly
+            # to verify the handler is wired in and blocks the redirect.
+            handler = SERVER._NoRedirectHandler()
+            import urllib.error
+            try:
+                # http_error_30x is called by the handler chain when a
+                # 30x response is received.  Simulate by calling it:
+                handler.http_error_301(
+                    req, None, redirect_status, "Redirect",
+                    {"Location": redirect_location},
+                )
+            except urllib.error.HTTPError:
+                # Expected: the handler raised, blocking the redirect.
+                raise
+            second_hop["called"] = True
+            # Should never reach here if the handler works.
+            return _FakeResponse(b"OK")
+
+        fake_opener = MagicMock()
+        fake_opener.open = _fake_open
+        fake_build = MagicMock(return_value=fake_opener)
+
+        with patch.object(SERVER.urllib.request, "build_opener", fake_build):
+            result = SERVER.download_segment_limited(ALLOWED_URL, dest, max_bytes=100)
+
+        part = dest.with_suffix(".part")
+        return result, part.exists(), dest.exists(), second_hop["called"]
+
+    def test_redirect_301_rejected(self):
+        # R1: 301 redirect is blocked; no second-hop connection.
+        dest = self.out / "segments" / "lv_a" / "seg_00.mp4"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        result, part_exists, dest_exists, second_hop = self._run_redirect_scenario(
+            301, "https://evil.example/seg.mp4", dest,
+        )
+        self.assertFalse(result["ok"])
+        self.assertIn("redirect not allowed", result["error"])
+        self.assertFalse(second_hop, "second-hop connection must not occur")
+        self.assertFalse(part_exists, ".part must be cleaned up")
+        self.assertFalse(dest_exists, "final cache file must not exist")
+
+    def test_redirect_302_to_evil_rejected(self):
+        # R2: 302 to a non-whitelisted host is blocked.
+        dest = self.out / "segments" / "lv_a" / "seg_00.mp4"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        result, part_exists, dest_exists, second_hop = self._run_redirect_scenario(
+            302, "https://evil.example/seg.mp4", dest,
+        )
+        self.assertFalse(result["ok"])
+        self.assertIn("redirect not allowed", result["error"])
+        self.assertFalse(second_hop)
+        self.assertFalse(part_exists)
+        self.assertFalse(dest_exists)
+
+    def test_redirect_303_307_308_rejected(self):
+        # R3: 303, 307, 308 all blocked.
+        dest = self.out / "segments" / "lv_a" / "seg_00.mp4"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        for code in (303, 307, 308):
+            with self.subTest(code=code):
+                result, part_exists, dest_exists, second_hop = \
+                    self._run_redirect_scenario(code, "https://evil.example/seg.mp4", dest)
+                self.assertFalse(result["ok"])
+                self.assertIn("redirect not allowed", result["error"])
+                self.assertFalse(second_hop)
+                self.assertFalse(part_exists)
+                self.assertFalse(dest_exists)
+
+    def test_redirect_to_localhost_rejected(self):
+        # R4: 302 to 127.0.0.1 is blocked.
+        dest = self.out / "segments" / "lv_a" / "seg_00.mp4"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        result, part_exists, dest_exists, second_hop = self._run_redirect_scenario(
+            302, "https://127.0.0.1/seg.mp4", dest,
+        )
+        self.assertFalse(result["ok"])
+        self.assertIn("redirect not allowed", result["error"])
+        self.assertFalse(second_hop)
+        self.assertFalse(part_exists)
+        self.assertFalse(dest_exists)
+
+    def test_redirect_https_to_http_rejected(self):
+        # R5: HTTPS -> HTTP scheme downgrade via redirect is blocked.
+        dest = self.out / "segments" / "lv_a" / "seg_00.mp4"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        result, part_exists, dest_exists, second_hop = self._run_redirect_scenario(
+            302, "http://platform-outputs.agnes-ai.space/seg.mp4", dest,
+        )
+        self.assertFalse(result["ok"])
+        self.assertIn("redirect not allowed", result["error"])
+        self.assertFalse(second_hop)
+        self.assertFalse(part_exists)
+        self.assertFalse(dest_exists)
+
+    def test_allowed_200_no_redirect_success(self):
+        # R6: a normal 200 response on the allowed host still succeeds;
+        # the _NoRedirectHandler is not triggered.
+        dest = self.out / "segments" / "lv_a" / "seg_00.mp4"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+
+        fake_resp = _FakeResponse(b"A" * 64)
+        fake_opener = MagicMock()
+        fake_opener.open = MagicMock(return_value=fake_resp)
+        fake_build = MagicMock(return_value=fake_opener)
+
+        with patch.object(SERVER.urllib.request, "build_opener", fake_build):
+            result = SERVER.download_segment_limited(ALLOWED_URL, dest, max_bytes=100)
+
+        self.assertTrue(result["ok"], "expected ok=True for 200 response")
+        self.assertTrue(dest.is_file(), "final cache file must exist after success")
+        self.assertEqual(
+            dest.read_bytes(), b"A" * 64,
+            "final cache content must equal the mocked response payload",
+        )
+        self.assertFalse(dest.with_suffix(".part").exists(), ".part must be cleaned up")
+        # build_opener was called with a _NoRedirectHandler instance.
+        self.assertTrue(
+            isinstance(fake_build.call_args[0][0], SERVER._NoRedirectHandler),
+        )
+
+    def test_rename_failure_cleans_part(self):
+        # R7: fault-inject tmp.rename(dest) OSError and verify the production
+        # failure convention without modifying server.py.
+        dest = self.out / "segments" / "lv_a" / "seg_00.mp4"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        part = dest.with_suffix(".part")
+        part.write_bytes(b"PART")
+
+        original_rename = Path.rename
+        rename_calls = []
+
+        def _rename_side_effect(target, *args, **kwargs):
+            rename_calls.append((str(part), str(target)))
+            if str(target) == str(dest):
+                raise OSError("simulated rename failure")
+            return original_rename(target, *args, **kwargs)
+
+        payload = b"A" * 8
+        offset = {"n": 0}
+        response_closed = MagicMock(name="response_closed")
+
+        class _RenamedResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                response_closed(*args)
+                return False
+
+            def read(self, size):
+                chunk = payload[offset["n"]:offset["n"] + size]
+                offset["n"] += len(chunk)
+                return chunk
+
+        fake_opener = MagicMock()
+        fake_opener.open = MagicMock(return_value=_RenamedResponse())
+        fake_build = MagicMock(return_value=fake_opener)
+
+        with patch.object(SERVER.urllib.request, "build_opener", fake_build), \
+             patch.object(Path, "rename", side_effect=_rename_side_effect):
+            result = SERVER.download_segment_limited(ALLOWED_URL, dest, max_bytes=100)
+
+        self.assertFalse(result["ok"])
+        self.assertIn("download failed:", result["error"])
+        self.assertIn("simulated rename failure", result["error"])
+        self.assertFalse(part.exists(), "residual .part file must be cleaned up")
+        self.assertFalse(dest.exists(), "final file must not be created when rename fails")
+        self.assertIn((str(part), str(dest)), rename_calls)
+        response_closed.assert_called_once()
 
     def test_rename_part_to_final(self):
         # #20 on the success path, verify the .part file is renamed to the final .mp4
@@ -725,6 +906,28 @@ class SegmentCacheTests(unittest.TestCase):
         self.assertEqual(json.loads(h.wfile.getvalue().decode() or "{}")["error"], "片段下载失败")
         self.assertEqual(len(part_cleaned), 1)
         self.assertFalse(Path(part_cleaned[0]).exists(), "route did not clean up .part")
+
+
+class _FakeResponse:
+    """One-shot fake HTTP response that yields a fixed byte payload.
+
+    Used by production-path tests (small-max-bytes, redirect scenarios,
+    200 success) to mock urllib's response object without real sockets.
+    """
+    def __init__(self, payload):
+        self._payload = payload
+        self._offset = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def read(self, size):
+        chunk = self._payload[self._offset:self._offset + size]
+        self._offset += len(chunk)
+        return chunk
 
 
 def _write_file_and_ok(dest):

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-import http.server, json, os, hmac, hashlib, urllib.request, urllib.error, threading, re, shutil, subprocess, tempfile, time, uuid
+import http.server, json, os, hmac, hashlib, socket, urllib.request, urllib.error, threading, re, shutil, subprocess, tempfile, time, uuid, base64
 from pathlib import Path
 import timeline_model
-from urllib.parse import urlparse, quote
+from urllib.parse import urlparse, quote, parse_qs
 
 ROOT = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("AGNES_DATA_DIR", str(ROOT / "data")))
@@ -15,10 +15,34 @@ CFG = DATA / "config.json"
 # Read once at startup; change requires restart.
 WEB_API_TOKEN = os.environ.get("AGNES_API_TOKEN", "")
 
+# Independent short-lived playback signing secret.
+# Must NOT be the same value as AGNES_API_TOKEN.  When unset, the
+# signed-playback path fails closed (403) while Bearer downloads keep working.
+PLAY_SECRET = os.environ.get("AGNES_PLAY_SECRET", "")
+
 # ---- Long-video configuration ----
 LONG_VIDEO_SECONDS = {30, 60}
 SEGMENT_SECONDS = 10  # must be within 4–12 for agnes-video-2.5/2.5-flash
 ALLOWED_DOWNLOAD_HOSTS = {"platform-outputs.agnes-ai.space"}
+
+# ---- Segment cache limits ----
+SEGMENT_MAX_BYTES = 500 * 1024 * 1024  # 500 MB hard cap per cached file
+PROXY_CACHE_MAX_BYTES = 1024 * 1024 * 1024  # 1 GB hard cap per proxied short-video cache
+
+# Per-(jid, seg_index) download lock registry: prevents concurrent duplicate
+# downloads of the same segment while allowing parallel work on other jid/idx.
+_seg_cache_locks = {}
+_seg_cache_locks_guard = threading.Lock()
+
+
+def _seg_cache_lock(jid: str, seg_index: int) -> threading.Lock:
+    key = (jid, seg_index)
+    with _seg_cache_locks_guard:
+        lock = _seg_cache_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _seg_cache_locks[key] = lock
+        return lock
 
 # Lock for thread-safe jobs.json read/write
 _jobs_lock = threading.Lock()
@@ -308,6 +332,128 @@ def download_segment(url: str, dest: Path) -> dict:
         return {"ok": False, "error": "download failed: %s" % e}
 
 
+# ---- Segment cache helpers (new for timeline editor Phase 1) ----
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Reject all automatic redirects (301/302/303/307/308) to prevent
+    SSRF bypass via redirect to disallowed hosts.  Segment cache URLs are
+    expected to be stable CDN/object-storage URLs with no redirect dependency.
+    """
+    def http_error_301(self, req, fp, code, msg, headers):
+        raise urllib.error.HTTPError(req.full_url, code, "redirect not allowed", headers, fp)
+    http_error_302 = http_error_301
+    http_error_303 = http_error_301
+    http_error_307 = http_error_301
+    http_error_308 = http_error_301
+
+
+def download_segment_limited(url: str, dest: Path,
+                            max_bytes: int = SEGMENT_MAX_BYTES) -> dict:
+    """Download a segment with a hard byte cap enforced *during* the copy.
+
+    If the stream exceeds ``max_bytes`` the download is aborted mid-copy and
+    the .part file is cleaned up.  Returns {"ok": bool, "error": str|None}.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme != "https":
+        return {"ok": False, "error": "only HTTPS downloads allowed"}
+    if parsed.hostname not in ALLOWED_DOWNLOAD_HOSTS:
+        return {"ok": False, "error": "host not in allowed download list"}
+    tmp = dest.with_suffix(".part")
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "AgnesVideo/1.0"})
+        opener = urllib.request.build_opener(_NoRedirectHandler())
+        with opener.open(req, timeout=120) as resp:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            total = 0
+            try:
+                with open(tmp, "wb") as out:
+                    while True:
+                        chunk = resp.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if total > max_bytes:
+                            tmp.unlink(missing_ok=True)
+                            return {"ok": False, "error": "download exceeds max size"}
+                        out.write(chunk)
+            except BaseException:
+                tmp.unlink(missing_ok=True)
+                raise
+        tmp.rename(dest)
+        return {"ok": True, "error": None}
+    except Exception as e:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+        return {"ok": False, "error": "download failed: %s" % e}
+
+
+def probe_video_duration(path: Path):
+    """Return actual video duration in seconds via local ffprobe, or None.
+
+    Uses ``ffprobe -v quiet -show_entries format=duration -of default=noprint_wrappers=1``.
+    No network calls.  Returns None when ffprobe is missing or probe fails.
+    """
+    if not path.is_file() or path.is_symlink() or shutil.which("ffprobe") is None:
+        return None
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "quiet",
+             "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1",
+             str(path)],
+            capture_output=True, text=True, timeout=15,
+        )
+        if r.returncode != 0:
+            return None
+        value = float(r.stdout.strip())
+        return value if value >= 0 else None
+    except (subprocess.SubprocessError, ValueError, OSError):
+        return None
+
+
+def parse_range_header(value: str, total_size: int):
+    """Parse a single-range HTTP Range header.
+
+    Returns:
+        ("full", None, None) if no Range header was supplied.
+        ("valid", start, end) inclusive 0-based byte offsets for legal Range.
+        ("invalid", None, None) for malformed or unsatisfiable Range.
+    """
+    if not value:
+        return ("full", None, None)
+    if not value.startswith("bytes="):
+        return ("invalid", None, None)
+    spec = value[6:]
+    if "," in spec:
+        return ("invalid", None, None)
+    if "-" not in spec:
+        return ("invalid", None, None)
+    left, right = spec.split("-", 1)
+    try:
+        if left == "" and right == "":
+            return ("invalid", None, None)
+        if left == "":
+            suffix = int(right)
+            if suffix <= 0:
+                return ("invalid", None, None)
+            start = max(0, total_size - suffix)
+            return ("valid", start, total_size - 1)
+        start = int(left)
+        if start >= total_size:
+            return ("invalid", None, None)
+        if right == "":
+            return ("valid", start, total_size - 1)
+        end = int(right)
+    except ValueError:
+        return ("invalid", None, None)
+    if end >= total_size:
+        end = total_size - 1
+    if start > end:
+        return ("invalid", None, None)
+    return ("valid", start, end)
+
+
 # ---- End FFmpeg helpers ----
 
 
@@ -347,9 +493,47 @@ def savecfg(c):
     os.chmod(CFG, 0o600)
 
 
+# Exception categories raised/caught for upstream API calls.
+# Each carries a sanitized, human-readable message safe for frontend display.
+UPSTREAM_ERROR_CATEGORIES = (
+    "http_error",     # HTTP non-2xx; message includes the status code only
+    "timeout",        # request exceeded the deadline
+    "network",        # connection/DNS-level failure
+    "business",       # upstream returned 2xx but payload rejected our request
+)
+
+
+def _sanitize_call_error(e: Exception, timeout: int) -> str:
+    """Return a short, sanitized description of an upstream call failure.
+
+    Never includes the API key, bearer token, Authorization header value, or
+    URL query parameters.  Only stable, low-sensitivity identifiers such as
+    the HTTP status code are surfaced.
+    """
+    if isinstance(e, urllib.error.HTTPError):
+        return "http_error: HTTP %s" % e.code
+    if isinstance(e, urllib.error.URLError) and isinstance(getattr(e, "reason", None), socket.timeout):
+        return "timeout: request exceeded %ss deadline" % timeout
+    if isinstance(e, socket.timeout):
+        return "timeout: request exceeded %ss deadline" % timeout
+    if isinstance(e, urllib.error.URLError):
+        return "network: upstream connection failed"
+    if isinstance(e, RuntimeError):
+        # Propagate our own structured RuntimeError messages unchanged.
+        return str(e)
+    # Last-resort fallback: do not echo the raw exception (could embed URLs
+    # with query strings); use a generic network label.
+    return "network: upstream request failed"
+
+
 def call(method, url, token, body=None, timeout=90):
     """Call the upstream Agnes API. Raises RuntimeError on any failure.
-    Does NOT include sensitive response bodies in the exception message."""
+
+    The RuntimeError message is a sanitized, category-prefixed string chosen
+    from UPSTREAM_ERROR_CATEGORIES so callers (and the frontend) can distinguish
+    HTTP errors, timeouts, and network failures without leaking credentials or
+    URL query parameters.
+    """
     raw = None if body is None else json.dumps(body).encode()
     req = urllib.request.Request(
         url,
@@ -364,12 +548,250 @@ def call(method, url, token, body=None, timeout=90):
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             b = r.read()
-            return r.status, json.loads(b.decode()) if b else {}
+            data = json.loads(b.decode()) if b else {}
+            # 2xx but the upstream business payload signals a rejection
+            # (e.g. 402/quota surfaced inside a 200, or a body-level error
+            # flag).  We only treat an explicit, non-empty "error" field as a
+            # business failure; never echo its text into the exception.
+            if isinstance(data, dict) and data.get("error") and not data.get("video_id"):
+                raise RuntimeError("business: upstream rejected request (no details)")
+            return r.status, data
     except urllib.error.HTTPError as e:
-        # Do not include upstream response body in the exception to avoid leaking sensitive data.
-        raise RuntimeError("Upstream API error (HTTP %s)" % e.code)
-    except Exception:
-        raise RuntimeError("Upstream API request failed")
+        raise RuntimeError(_sanitize_call_error(e, timeout))
+    except RuntimeError:
+        # Our own business failure above: re-raise as-is.
+        raise
+    except socket.timeout:
+        raise RuntimeError("timeout: request exceeded %ss deadline" % timeout)
+    except Exception as e:
+        raise RuntimeError(_sanitize_call_error(e, timeout))
+
+
+def _mp4_range_plan(range_header, total_size):
+    """Shared single-Range plan for local MP4 serving.
+
+    Returns ("full"|"partial"|"unsatisfiable", start, end). Malformed or
+    unsupported Range syntax is ignored as a full 200; syntactically valid
+    but unsatisfiable ranges return 416. This is local to /api/download and
+    /api/jobs/<jid>/proxy, and does not alter parse_range_header.
+    """
+    if not range_header:
+        return ("full", None, None)
+    parts = range_header.split(",", 1)
+    if len(parts) != 1 or not parts[0].startswith("bytes="):
+        return ("full", None, None)
+    spec = parts[0][6:]
+    if "-" not in spec or spec.count("-") != 1:
+        return ("full", None, None)
+    left, right = spec.split("-", 1)
+    if left == "" and right == "":
+        return ("full", None, None)
+    if left == "":
+        if not right.isdigit():
+            return ("full", None, None)
+        suffix = int(right)
+        if suffix == 0:
+            return ("unsatisfiable", None, None)
+        start = max(0, total_size - suffix)
+        return ("partial", start, total_size - 1)
+    if not left.isdigit():
+        return ("full", None, None)
+    start = int(left)
+    if start >= total_size:
+        return ("unsatisfiable", None, None)
+    if right == "":
+        return ("partial", start, total_size - 1)
+    if not right.isdigit():
+        return ("full", None, None)
+    end = int(right)
+    if end >= total_size:
+        end = total_size - 1
+    if start > end:
+        return ("unsatisfiable", None, None)
+    return ("partial", start, end)
+
+
+# ---------------------------------------------------------------------------
+# Short-lived signed playback URL support (GET /api/download/ only)
+# ---------------------------------------------------------------------------
+
+def _play_secret() -> str:
+    """Return the independent playback signing secret if configured.
+
+    Intentionally separate from AGNES_API_TOKEN so a long-lived web token
+    can never be reused as a signed-URL credential.
+    """
+    return PLAY_SECRET
+
+
+# Whitelist of Content-Disposition modes bindable into a signed URL.
+# The client cannot override response headers: the disposition value is
+# part of the HMAC payload, and only these two strings are ever accepted.
+PLAY_DISPOSITIONS = ("inline", "attachment")
+
+
+def _issue_play_sig(basename: str, exp: int, purpose: str = "play", method: str = "GET",
+                    disposition: str = "inline") -> str:
+    """HMAC-SHA256 signed playback capability (base64url, no padding).
+
+    Payload (strict, single-line, canonical, 5 fields):
+        purpose|basename|method|exp|disposition
+
+    Binds basename, purpose, method, disposition and a short expiry; no
+    long-lived Bearer token is ever embedded in the URL.
+    """
+    secret = _play_secret()
+    if not secret:
+        raise RuntimeError("AGNES_PLAY_SECRET is not configured")
+    if disposition not in PLAY_DISPOSITIONS:
+        raise ValueError("disposition must be one of %s" % (PLAY_DISPOSITIONS,))
+    payload = "|".join([purpose, basename, method, str(exp), disposition]).encode("utf-8")
+    sig = hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(sig).rstrip(b"=").decode("ascii")
+
+
+def _verify_play_signature(basename: str, purpose: str, method: str, exp_str: str,
+                           sig: str, disposition: str = "") -> tuple:
+    """Validate a short-lived playback signature.
+
+    Returns (True, None, disposition_used) on success, or
+    (False, reason, "inline") on failure where reason is one of:
+      "secret_unset" - AGNES_PLAY_SECRET not configured (fail closed)
+      "missing"      - any required parameter absent
+      "malformed"    - exp is not an integer, or disposition is not
+                       whitelisted (inline/attachment)
+      "expired"      - exp < now
+      "invalid"      - HMAC mismatch (covers all tampered fields)
+
+    Backwards compatibility: pre-disposition ("legacy") 4-field signatures
+    (purpose|basename|method|exp) still verify and are treated as
+    disposition="inline", so in-flight player links keep working.
+    """
+    secret = _play_secret()
+    if not secret:
+        return (False, "secret_unset", "inline")
+    disp = disposition if disposition else "inline"
+    if disp not in PLAY_DISPOSITIONS:
+        # Unknown disposition is rejected up front; the issuer never signs
+        # non-whitelisted values, so this also blocks header override.
+        return (False, "malformed", "inline")
+    if not basename or not purpose or not method or not exp_str or not sig:
+        return (False, "missing", "inline")
+    try:
+        exp_int = int(exp_str)
+    except (TypeError, ValueError):
+        return (False, "malformed", "inline")
+    if exp_int < int(time.time()):
+        return (False, "expired", "inline")
+    key = secret.encode("utf-8")
+    payload5 = ("%s|%s|%s|%d|%s" % (purpose, basename, method, exp_int, disp)).encode("utf-8")
+    expected5 = base64.urlsafe_b64encode(
+        hmac.new(key, payload5, hashlib.sha256).digest()).rstrip(b"=").decode("ascii")
+    if hmac.compare_digest(expected5, sig):
+        return (True, None, disp)
+    # Legacy 4-field signature (issued before disposition was added):
+    # verifies only with the inline semantics it was originally bound to.
+    payload4 = ("%s|%s|%s|%d" % (purpose, basename, method, exp_int)).encode("utf-8")
+    expected4 = base64.urlsafe_b64encode(
+        hmac.new(key, payload4, hashlib.sha256).digest()).rstrip(b"=").decode("ascii")
+    if hmac.compare_digest(expected4, sig):
+        return (True, None, "inline")
+    return (False, "invalid", "inline")
+
+
+# Characters that must never reach a response header value.  This is the
+# full Unicode "Cc" control block used in HTTP header hardening:
+#   U+0000–U+001F  (C0, incl. \r \n \0  → CRLF/NUL response-splitting)
+#   U+007F–U+009F  (DEL + C1, incl. the 8-bit control/escape range)
+# Ordinary printable Unicode (incl. CJK and legal punctuation) is preserved.
+_HEADER_FORBIDDEN = set(
+    chr(c) for c in list(range(0x00, 0x20)) + list(range(0x7f, 0xa0))
+)
+
+# Path separators on both POSIX and Windows.  A backslash must be treated
+# exactly like "/" so a directory prefix (C:\fake\folder\...) can never leak
+# into the header.
+_PATH_SEPARATORS = ("/", "\\")
+
+
+def _sanitize_filename_component(name: str) -> str:
+    """Reduce *name* to a single safe path component for a header value.
+
+    - Split on every path separator ("/" and "\\") and keep only the final
+      segment, so no directory prefix (POSIX, Windows, or mixed) survives.
+    - Remove any remaining path-separator characters (defence-in-depth).
+    - Drop a leading "." so relative path tricks (., .., .hidden) are removed.
+    - Remove C0/C1 control chars (U+0000–U+001F, U+007F–U+009F), the CRLF/NUL
+      header-injection vectors.
+    - Collapse runs of whitespace to a single space and trim.
+    - Fall back to a fixed safe default when nothing usable remains.
+    """
+    # Last segment across every separator; backslashes can't appear in a
+    # POSIX basename, but we normalize them so Windows-style names behave.
+    for sep in _PATH_SEPARATORS:
+        name = name.replace(sep, "/")
+    base = name.rsplit("/", 1)[-1]
+    base = base.lstrip(".")
+    cleaned = "".join(ch for ch in base if ch not in _HEADER_FORBIDDEN)
+    # Belt-and-braces: ensure no separator char survived into the segment.
+    cleaned = cleaned.replace("/", "").replace("\\", "")
+    # Collapse internal whitespace runs to a single space and trim.
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        cleaned = "video.mp4"
+    return cleaned
+
+
+def _safe_content_disposition(filename: str, mode: str) -> str:
+    """Build a Content-Disposition header value safe for header injection.
+
+    Produces the RFC 6266 two-part form::
+
+        <mode>; filename="<ascii-fallback>"; filename*=UTF-8''<pct-encoded>
+
+    where:
+      * <ascii-fallback> is the sanitized name with any non-ASCII byte
+        dropped, giving a usable fallback for clients that ignore
+        filename* (and guaranteed control-char free);
+      * <pct-encoded> is the percent-encoding of the sanitized name's UTF-8
+        bytes (RFC 5987), NOT quote-plus (spaces stay %20, never +).
+
+    The same generator serves both "inline" and "attachment" so the two
+    cannot diverge.  Only the sanitized basename is ever embedded; the raw
+    user-supplied filename never reaches the header unprocessed.
+    """
+    if mode not in PLAY_DISPOSITIONS:
+        mode = "inline"
+    safe = _sanitize_filename_component(filename)
+
+    # ASCII fallback: keep only safe printable ASCII (letters/digits and a
+    # small punctuation set), dropping non-ASCII (incl. CJK) plus the
+    # double-quote and backslash so the fallback is always header-safe.
+    ascii_fallback = "".join(
+        ch for ch in safe
+        if 0x20 < ord(ch) < 0x7f and ch not in '"\\'
+    ).strip()
+    if not ascii_fallback:
+        ascii_fallback = "video.mp4"
+
+    # RFC 5987 / 3986 percent-encoding of UTF-8 bytes; unreserved chars kept
+    # as-is, everything else upper-hex percent-encoded (space -> %20).
+    unreserved = set(
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "abcdefghijklmnopqrstuvwxyz"
+        "0123456789"
+        "-._~"
+    )
+    enc_parts = []
+    for byte in safe.encode("utf-8"):
+        ch = chr(byte)
+        if ch in unreserved:
+            enc_parts.append(ch)
+        else:
+            enc_parts.append("%%%02X" % byte)
+    pct = "".join(enc_parts)
+
+    return '%s; filename="%s"; filename*=UTF-8\'\'%s' % (mode, ascii_fallback, pct)
 
 
 def jobs_load():
@@ -393,6 +815,47 @@ def jobs_save_locked(j):
         jobs_save(j)
 
 
+def _sanitize_progress_int(value, default=0):
+    """Return a safe progress value for persistence and frontend display.
+
+    - ``None`` (progress key absent) -> ``default`` (0).
+    - ``bool`` -> 0 or 100.
+    - finite numeric (int/float) -> clamped to 0..100.
+    - ``float('nan')`` / string ``"NaN"`` -> 0; ``float('inf')`` / ``"inf"``
+      -> 100; ``-inf`` -> 0.
+    - numeric strings (e.g. ``"50"``) -> 50 (clamped).
+    - any other value that cannot be interpreted as a number (e.g. the
+      literal string ``"unknown"``) -> returned unchanged, preserving the
+      existing ``test_progress_non_numeric_ignored`` contract.  The frontend
+      display separately guards against non-numeric progress so it never
+      renders as ``NaN``.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return 100 if value else 0
+    if isinstance(value, (int, float)):
+        number = float(value)
+    else:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return value
+    if number != number:  # NaN
+        number = 0.0
+    elif number == float("inf"):
+        number = 100.0
+    elif number == float("-inf"):
+        number = 0.0
+    return max(0, min(100, int(number)))
+
+
+def _proxy_cache_path(jid: str) -> Path:
+    """Return a stable per-job proxy cache path under OUT/proxy."""
+    safe_jid = re.sub(r"[^A-Za-z0-9_.-]", "_", str(jid))
+    return OUT / "proxy" / ("%s.mp4" % safe_jid)
+
+
 def normalize(j, live):
     merged = {**j, **live}
     s = str(merged.get("status", "unknown")).lower()
@@ -412,9 +875,7 @@ def normalize(j, live):
         "canceled": "canceled",
     }
     merged["status"] = mapping.get(s, s)
-    p = merged.get("progress")
-    if isinstance(p, (int, float)):
-        merged["progress"] = max(0, min(100, int(p)))
+    merged["progress"] = _sanitize_progress_int(merged.get("progress"), 0)
     return merged
 
 
@@ -448,7 +909,10 @@ class H(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(b)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        self.wfile.write(b)
+        # HEAD responses must not carry a body (RFC 7231): keep the status
+        # and headers identical to GET, but suppress the JSON payload.
+        if self.command != "HEAD":
+            self.wfile.write(b)
 
     def _auth_ok(self) -> bool:
         """Check the web access token. Return True if valid."""
@@ -461,6 +925,115 @@ class H(http.server.BaseHTTPRequestHandler):
             self.sendj({"error": "未授权或令牌无效。请重新输入网站访问令牌。"}, 401)
             return False
         return True
+
+    def _require_download_auth(self) -> bool:
+        """Allow Bearer OR short-lived signed URL for /api/download only.
+
+        Preferred path: the existing Bearer token (unchanged behavior,
+        always served inline).  Fallback: a short-lived signed playback
+        URL, whose disposition (inline/attachment) is bound into the
+        signature and cannot be overridden by the client.  Fails closed
+        (403) when AGNES_PLAY_SECRET is not configured and no valid
+        Bearer is present, so an unconfigured environment never opens
+        signed downloads.  All other /api/* routes remain Bearer-only.
+        """
+        self._verified_disposition = "inline"
+        if self._auth_ok():
+            return True
+
+        q = parse_qs(urlparse(self.path).query)
+        purpose = (q.get("purpose") or [""])[0]
+        method = (q.get("method") or [""])[0]
+        exp_str = (q.get("exp") or [""])[0]
+        sig = (q.get("sig") or [""])[0]
+        disposition = (q.get("disposition") or [""])[0]
+        basename = self.path[len("/api/download/"):].split("?", 1)[0]
+
+        # Method binding (production contract): the issuer
+        # (_handle_playlink) only signs method="GET".  The verifier must
+        # enforce that the signed `method` param is exactly "GET":
+        #   - a GET request consumes the GET-signed URL;
+        #   - a HEAD request may reuse the GET-signed URL for metadata
+        #     probing (headers only, no body);
+        #   - no other method value is accepted, so a hypothetical
+        #     HEAD-only signature can never authorize a GET download.
+        if method != "GET":
+            self.sendj({"error": "播放签名无效（method）"}, 403)
+            return False
+
+        ok, reason, disp_used = _verify_play_signature(
+            basename, purpose, method, exp_str, sig, disposition)
+        if ok:
+            self._verified_disposition = disp_used
+            return True
+
+        status_map = {
+            "secret_unset": 403,  # fail closed when secret not configured
+            "missing": 403,
+            "malformed": 403,
+            "expired": 410,
+            "invalid": 403,
+        }
+        code = status_map.get(reason, 403)
+        self.sendj({"error": "播放签名无效（%s）" % reason}, code)
+        return False
+
+    def _handle_playlink(self, jid: str, disposition: str = "inline") -> None:
+        """GET /api/jobs/<jid>/playlink[?disposition=attachment] — Bearer only.
+
+        Issues a short-lived signed URL for the merged long-video MP4 so a
+        native <video> element can play without carrying the Authorization
+        header, and so the download anchor can fetch a reliable attachment
+        download.  The disposition is bound into the signature (whitelist:
+        inline/attachment); the client cannot override response headers.
+        Only available when AGNES_PLAY_SECRET is configured (fail closed
+        -> 503 otherwise).
+        """
+        if disposition not in PLAY_DISPOSITIONS:
+            return self.sendj({"error": "非法 disposition 值"}, 400)
+        if not _play_secret():
+            return self.sendj({"error": "播放签名未配置，无法签发"}, 503)
+
+        jobs = jobs_load()
+        j = jobs.get(jid)
+        if not j:
+            return self.sendj({"error": "找不到任务"}, 404)
+        if not j.get("long"):
+            return self.sendj({"error": "该任务不是长视频任务"}, 403)
+        if j.get("status") != "succeeded":
+            return self.sendj({"error": "任务尚未完成"}, 403)
+        if j.get("merge_status") != "merged":
+            return self.sendj({"error": "长视频尚未合并完成"}, 403)
+
+        merged_file = j.get("merged_file")
+        if not merged_file:
+            return self.sendj({"error": "缺少合并文件"}, 403)
+
+        basename = str(merged_file).split("/")[-1]
+        if not basename or not basename.endswith(".mp4") or "/" in basename or ".." in basename:
+            return self.sendj({"error": "非法文件名"}, 400)
+
+        # Re-run the same path safety checks as /api/download.
+        safe_path = OUT / basename
+        try:
+            resolved = safe_path.resolve()
+            out_resolved = OUT.resolve()
+            if hasattr(resolved, "is_relative_to"):
+                inside = resolved.is_relative_to(out_resolved)
+            else:
+                inside = str(resolved).startswith(str(out_resolved))
+            if not inside or not resolved.is_file():
+                return self.sendj({"error": "文件不存在"}, 404)
+        except Exception:
+            return self.sendj({"error": "文件不存在"}, 404)
+
+        exp = int(time.time()) + 600  # 600s TTL
+        sig = _issue_play_sig(basename, exp, purpose="play", method="GET",
+                              disposition=disposition)
+        url = ("/api/download/%s?purpose=play&method=GET&exp=%d&disposition=%s&sig=%s"
+               % (quote(basename), exp, disposition, sig))
+        return self.sendj({"url": url, "exp": exp, "expires_in": 600,
+                           "disposition": disposition})
 
     def body(self):
         n = int(self.headers.get("Content-Length", "0"))
@@ -478,16 +1051,253 @@ class H(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b)
             return
-        # All /api/ routes require authentication.
-        if not self._require_auth():
-            return
+        # /api/download supports Bearer OR short-lived signed URL;
+        # all other /api/* routes remain Bearer-only.
+        if p.startswith("/api/download/"):
+            if not self._require_download_auth():
+                return
+        else:
+            if p.startswith("/api/") and not self._require_auth():
+                return
         if p == "/api/config":
             c = cfg()
             return self.sendj({"token_set": bool(c.get("token"))})
         if p == "/api/jobs/list":
             return self.sendj(list(jobs_load().values())[::-1])
+        # ---- Segment cache: GET /api/jobs/<jid>/segments/<seg_index> ----
+        seg_match = re.match(r"^/api/jobs/([^/]+)/segments/(\d{1,2})$", p)
+        if seg_match:
+            seg_jid = seg_match.group(1)
+            seg_index = int(seg_match.group(2))
+
+            jobs = jobs_load()
+            j = jobs.get(seg_jid)
+            if not j:
+                return self.sendj({"error": "找不到任务"}, 404)
+            if not j.get("long"):
+                return self.sendj({"error": "仅长视频任务支持片段缓存"}, 400)
+
+            segs = j.get("segments", [])
+            if seg_index >= len(segs):
+                return self.sendj({"error": "片段索引超出范围"}, 400)
+            seg = segs[seg_index]
+            if seg.get("status") != "succeeded":
+                return self.sendj({"error": "片段尚未完成，无法缓存"}, 409)
+
+            seg_url = seg.get("url") or seg.get("video_url")
+            if not seg_url:
+                return self.sendj({"error": "片段缺少下载 URL"}, 404)
+
+            # Build safe cache path: OUT/segments/<jid>/seg_<idx:02d>.mp4
+            cache_dir = OUT / "segments" / seg_jid
+            cache_path = cache_dir / ("seg_%02d.mp4" % seg_index)
+            # Security: resolve and verify inside OUT/segments/<jid>.
+            try:
+                resolved_cache = cache_path.resolve()
+                out_resolved = OUT.resolve()
+                cache_dir_resolved = (OUT / "segments").resolve()
+                cache_ok = (
+                    resolved_cache.is_relative_to(cache_dir_resolved)
+                    and resolved_cache.name == cache_path.name
+                    and not resolved_cache.is_symlink()
+                )
+                if not cache_ok:
+                    return self.sendj({"error": "非法缓存路径"}, 400)
+            except Exception:
+                return self.sendj({"error": "非法缓存路径"}, 400)
+
+            # Acquire per-(jid, seg_index) lock to prevent concurrent duplicate downloads
+            lock = _seg_cache_lock(seg_jid, seg_index)
+            with lock:
+                # Double-check: cache may have been filled by a concurrent request
+                cache_hit = (
+                    cache_path.is_file()
+                    and not cache_path.is_symlink()
+                    and cache_path.stat().st_size > 0
+                )
+                if not cache_hit:
+                    cache_dir.mkdir(parents=True, exist_ok=True)
+                    dl_result = download_segment_limited(str(seg_url), cache_path)
+                    if not dl_result["ok"]:
+                        part = cache_path.with_suffix(".part")
+                        if part.exists():
+                            part.unlink(missing_ok=True)
+                        if dl_result.get("error") == "download exceeds max size":
+                            return self.sendj(
+                                {"error": "片段文件超过缓存上限"},
+                                400,
+                            )
+                        return self.sendj(
+                            {"error": "片段下载失败"},
+                            502,
+                        )
+
+            # Read file for streaming
+            try:
+                if not cache_path.is_file() or cache_path.is_symlink():
+                    return self.sendj({"error": "非法缓存路径"}, 400)
+                fsize = cache_path.stat().st_size
+            except OSError:
+                return self.sendj({"error": "缓存文件不可读"}, 500)
+            if fsize == 0:
+                return self.sendj({"error": "缓存文件为空"}, 500)
+
+            # Probe actual video duration (local ffprobe only; no network)
+            actual_duration = probe_video_duration(cache_path)
+
+            # Parse Range header for partial content support
+            range_header = self.headers.get("Range", "")
+            range_kind, start, end = parse_range_header(range_header, fsize)
+
+            if range_kind == "invalid":
+                self.send_response(416)
+                self.send_header("Content-Range", "bytes */%d" % fsize)
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                return
+
+            if range_kind == "valid":
+                self.send_response(206)
+                self.send_header("Content-Type", "video/mp4")
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, fsize))
+                self.send_header("Content-Length", str(end - start + 1))
+                if actual_duration is not None:
+                    self.send_header("X-Source-Duration", str(actual_duration))
+                else:
+                    self.send_header("X-Source-Duration-Available", "false")
+                self.end_headers()
+                try:
+                    with open(cache_path, "rb") as f:
+                        f.seek(start)
+                        remaining = end - start + 1
+                        while remaining > 0:
+                            chunk = f.read(min(65536, remaining))
+                            if not chunk:
+                                break
+                            self.wfile.write(chunk)
+                            remaining -= len(chunk)
+                except OSError:
+                    pass
+            else:
+                # Full file: 200
+                self.send_response(200)
+                self.send_header("Content-Type", "video/mp4")
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Content-Length", str(fsize))
+                if actual_duration is not None:
+                    self.send_header("X-Source-Duration", str(actual_duration))
+                else:
+                    self.send_header("X-Source-Duration-Available", "false")
+                self.end_headers()
+                try:
+                    with open(cache_path, "rb") as f:
+                        while True:
+                            chunk = f.read(65536)
+                            if not chunk:
+                                break
+                            self.wfile.write(chunk)
+                except OSError:
+                    pass
+            return
+
+        # ---- Short-video proxy: GET /api/jobs/<jid>/proxy ----
+        # Must be matched BEFORE the generic /api/jobs/<jid> block below,
+        # otherwise jid would be mis-parsed as the literal string "proxy".
+        # Serves the short-video's upstream CDN file via a local, whitelisted,
+        # byte-capped download cache (OUT/proxy/<jid>.mp4) so mobile browsers
+        # can play/seek inline without reaching the external CDN directly.
+        proxy_match = re.match(r"^/api/jobs/([^/]+)/proxy$", p)
+        if proxy_match:
+            proxy_jid = proxy_match.group(1)
+            jobs = jobs_load()
+            j = jobs.get(proxy_jid)
+            if not j:
+                return self.sendj({"error": "找不到任务"}, 404)
+            src_url = j.get("video_url") or j.get("url") or j.get("output_url")
+            if not src_url:
+                return self.sendj({"error": "任务尚无可播放视频 URL"}, 404)
+            if j.get("long"):
+                return self.sendj({"error": "长视频请使用合并输出或片段缓存"}, 400)
+            parsed = urlparse(src_url)
+            if parsed.scheme != "https" or parsed.hostname not in ALLOWED_DOWNLOAD_HOSTS:
+                return self.sendj({"error": "视频源不在白名单内"}, 400)
+            proxy_cache = _proxy_cache_path(proxy_jid)
+            lock = _seg_cache_lock(proxy_jid, -1)
+            with lock:
+                cache_hit = (
+                    proxy_cache.is_file()
+                    and not proxy_cache.is_symlink()
+                    and proxy_cache.stat().st_size > 0
+                )
+                if not cache_hit:
+                    proxy_cache.parent.mkdir(parents=True, exist_ok=True)
+                    dl = download_segment_limited(str(src_url), proxy_cache, max_bytes=PROXY_CACHE_MAX_BYTES)
+                    if not dl["ok"]:
+                        part = proxy_cache.with_suffix(".part")
+                        if part.exists():
+                            part.unlink(missing_ok=True)
+                        if dl.get("error") == "download exceeds max size":
+                            return self.sendj({"error": "视频文件超过缓存上限"}, 400)
+                        return self.sendj({"error": "视频下载失败，请稍后重试"}, 502)
+            try:
+                resolved = proxy_cache.resolve()
+                out_resolved = OUT.resolve()
+                if not resolved.is_relative_to(out_resolved) or not resolved.is_file():
+                    return self.sendj({"error": "缓存文件不存在"}, 404)
+                fsize = resolved.stat().st_size
+                action, start, end = _mp4_range_plan(self.headers.get("Range", ""), fsize)
+                if action == "unsatisfiable":
+                    self.send_response(416)
+                    self.send_header("Content-Range", "bytes */%d" % fsize)
+                    self.send_header("Content-Length", "0")
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    return
+                disposition = 'inline; filename="%s.mp4"' % re.sub(r"[^A-Za-z0-9_.-]", "_", proxy_jid)
+                if action == "partial":
+                    length = end - start + 1
+                    self.send_response(206)
+                    self.send_header("Content-Type", "video/mp4")
+                    self.send_header("Accept-Ranges", "bytes")
+                    self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, fsize))
+                    self.send_header("Content-Length", str(length))
+                    self.send_header("Content-Disposition", disposition)
+                    self.end_headers()
+                    with open(resolved, "rb") as f:
+                        f.seek(start)
+                        remaining = length
+                        while remaining > 0:
+                            chunk = f.read(min(65536, remaining))
+                            if not chunk:
+                                break
+                            self.wfile.write(chunk)
+                            remaining -= len(chunk)
+                else:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "video/mp4")
+                    self.send_header("Accept-Ranges", "bytes")
+                    self.send_header("Content-Length", str(fsize))
+                    self.send_header("Content-Disposition", disposition)
+                    self.end_headers()
+                    with open(resolved, "rb") as f:
+                        while True:
+                            chunk = f.read(65536)
+                            if not chunk:
+                                break
+                            self.wfile.write(chunk)
+            except Exception:
+                return self.sendj({"error": "文件读取失败"}, 500)
+            return
+
         if p.startswith("/api/jobs/"):
             jid = p.rsplit("/", 1)[-1]
+            # Signed short-lived playback URL (Bearer only, merged long videos).
+            if p.endswith("/playlink"):
+                jid = p.rsplit("/playlink", 1)[0].rsplit("/", 1)[-1]
+                pl_q = parse_qs(urlparse(self.path).query)
+                pl_disp = (pl_q.get("disposition") or ["inline"])[0]
+                return self._handle_playlink(jid, disposition=pl_disp)
             jobs = jobs_load()
             j = jobs.get(jid)
             if not j:
@@ -589,17 +1399,13 @@ class H(http.server.BaseHTTPRequestHandler):
 
         # ---- Secure MP4 download: GET /api/download/<filename> ----
         if p.startswith("/api/download/"):
-            filename = p[len("/api/download/"):]
-            # Strip query string
-            filename = filename.split("?", 1)[0]
+            filename = p[len("/api/download/"):].split("?", 1)[0]
             if not filename or not filename.endswith(".mp4") or "/" in filename or ".." in filename:
                 return self.sendj({"error": "非法文件名"}, 400)
             safe_path = OUT / filename
-            # Resolve and verify it is still inside OUT (prevent symlink / traversal)
             try:
                 resolved = safe_path.resolve()
                 out_resolved = OUT.resolve()
-                # Python 3.9+ has is_relative_to; fall back to string prefix for older
                 if hasattr(resolved, "is_relative_to"):
                     inside = resolved.is_relative_to(out_resolved)
                 else:
@@ -608,24 +1414,118 @@ class H(http.server.BaseHTTPRequestHandler):
                     return self.sendj({"error": "文件不存在"}, 404)
             except Exception:
                 return self.sendj({"error": "文件不存在"}, 404)
+
             try:
                 fsize = resolved.stat().st_size
-                self.send_response(200)
-                self.send_header("Content-Type", "video/mp4")
-                self.send_header("Content-Length", str(fsize))
-                self.send_header("Content-Disposition", 'attachment; filename="%s"' % filename)
-                self.end_headers()
-                with open(resolved, "rb") as f:
-                    while True:
-                        chunk = f.read(65536)
-                        if not chunk:
-                            break
-                        self.wfile.write(chunk)
+                action, start, end = _mp4_range_plan(self.headers.get("Range", ""), fsize)
+                if action == "unsatisfiable":
+                    self.send_response(416)
+                    self.send_header("Content-Range", "bytes */%d" % fsize)
+                    self.send_header("Content-Length", "0")
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    return
+                # disposition is fixed at auth time: Bearer -> inline (unchanged);
+                # signed URL -> the value bound into its signature (whitelisted).
+                disp_mode = getattr(self, "_verified_disposition", "inline")
+                if disp_mode not in PLAY_DISPOSITIONS:
+                    disp_mode = "inline"
+                # Build the header via the shared safe generator so the
+                # sanitized basename + RFC 5987 encoding is used and no raw
+                # user value (incl. CRLF/NUL) reaches the header.
+                disposition = _safe_content_disposition(filename, disp_mode)
+                if action == "partial":
+                    length = end - start + 1
+                    self.send_response(206)
+                    self.send_header("Content-Type", "video/mp4")
+                    self.send_header("Accept-Ranges", "bytes")
+                    self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, fsize))
+                    self.send_header("Content-Length", str(length))
+                    self.send_header("Content-Disposition", disposition)
+                    self.send_header("Referrer-Policy", "no-referrer")
+                    self.end_headers()
+                    with open(resolved, "rb") as f:
+                        f.seek(start)
+                        remaining = length
+                        while remaining > 0:
+                            chunk = f.read(min(65536, remaining))
+                            if not chunk:
+                                break
+                            self.wfile.write(chunk)
+                            remaining -= len(chunk)
+                else:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "video/mp4")
+                    self.send_header("Accept-Ranges", "bytes")
+                    self.send_header("Content-Length", str(fsize))
+                    self.send_header("Content-Disposition", disposition)
+                    self.send_header("Referrer-Policy", "no-referrer")
+                    self.end_headers()
+                    with open(resolved, "rb") as f:
+                        while True:
+                            chunk = f.read(65536)
+                            if not chunk:
+                                break
+                            self.wfile.write(chunk)
             except Exception:
                 return self.sendj({"error": "文件读取失败"}, 500)
             return
 
         return self.sendj({"error": "not found"}, 404)
+
+    def do_HEAD(self):
+        """HEAD /api/download/<basename>: same auth/validation/headers as the
+        GET 200 path, but no body and Range is ignored.  Mirrors GET so a
+        client can probe availability/size/content-disposition without
+        downloading bytes.  Non-download paths fall through to the default
+        501 (unchanged contract for those routes)."""
+        p = urlparse(self.path).path
+        if not p.startswith("/api/download/"):
+            # Other routes keep their existing (501) HEAD behavior.
+            self.send_response(501)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
+        if not self._require_download_auth():
+            return
+
+        filename = p[len("/api/download/"):].split("?", 1)[0]
+        if not filename or not filename.endswith(".mp4") or "/" in filename or ".." in filename:
+            return self.sendj({"error": "非法文件名"}, 400)
+        safe_path = OUT / filename
+        try:
+            resolved = safe_path.resolve()
+            out_resolved = OUT.resolve()
+            if hasattr(resolved, "is_relative_to"):
+                inside = resolved.is_relative_to(out_resolved)
+            else:
+                inside = str(resolved).startswith(str(out_resolved))
+            if not inside or not resolved.is_file():
+                return self.sendj({"error": "文件不存在"}, 404)
+        except Exception:
+            return self.sendj({"error": "文件不存在"}, 404)
+
+        try:
+            fsize = resolved.stat().st_size
+        except OSError:
+            return self.sendj({"error": "文件读取失败"}, 500)
+        # disposition is fixed at auth time exactly as in the GET path.
+        disp_mode = getattr(self, "_verified_disposition", "inline")
+        if disp_mode not in PLAY_DISPOSITIONS:
+            disp_mode = "inline"
+        disposition = _safe_content_disposition(filename, disp_mode)
+
+        # HEAD: full-GET 200 resource headers, but never send a body and
+        # ignore any Range header (the resource is always reported whole).
+        self.send_response(200)
+        self.send_header("Content-Type", "video/mp4")
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(fsize))
+        self.send_header("Content-Disposition", disposition)
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.end_headers()
+        # No body written on purpose.
 
     def do_POST(self):
         p = urlparse(self.path).path
@@ -882,18 +1782,22 @@ class H(http.server.BaseHTTPRequestHandler):
                         _, r = call("POST", "https://apihub.agnes-ai.com/v1/videos", token, seg_body)
                         vid = r.get("video_id")
                         if not vid:
-                            raise RuntimeError("no video_id")
+                            raise RuntimeError("business: upstream did not return a video_id")
                         seg_job["id"] = vid
                         seg_job["video_id"] = vid
                         segments[seg_job["segment_index"]]["video_id"] = vid
                         segments[seg_job["segment_index"]]["status"] = "queued"
                         created_any = True
-                    except Exception:
-                        # Mark failed, continue with remaining
-                        segments[seg_job["segment_index"]]["status"] = "failed"
-                        segments[seg_job["segment_index"]]["error"] = "创建失败"
+                    except Exception as e:
+                        # Preserve the sanitized category-prefixed error so the
+                        # user can tell HTTP error / timeout / network / business
+                        # failure apart.  call() already sanitizes; str(e) is safe.
+                        seg_err = str(e)
+                        idx = seg_job["segment_index"]
+                        segments[idx]["status"] = "failed"
+                        segments[idx]["error"] = "创建失败: %s" % seg_err
                         seg_job["status"] = "failed"
-                        seg_job["error"] = "创建失败"
+                        seg_job["error"] = "创建失败: %s" % seg_err
                 if not created_any:
                     return self.sendj({"error": "所有分段创建均失败，请重试"}, 502)
                 # Build parent job record

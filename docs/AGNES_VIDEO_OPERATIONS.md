@@ -75,10 +75,19 @@ ssh -N \
 | 网站访问令牌（本地） | `~/.agens/video-site-token` | 600 权限，不得复制到日志或聊天 |
 | 上游 API Key（远端） | `/var/lib/agnes-video/data/config.json` | 700 权限，仅 `agnestudio` 用户可读 |
 | 上游 API Key（本地调试） | `data/config.json`（项目目录） | 600 权限，不得提交到版本库 |
+| 签名播放秘密（远端） | `/etc/agnes-video/agnestudio.env` 中的 `AGNES_PLAY_SECRET` 行（可选，未配置 = 签名播放/下载关闭，fail closed） | 至少 32 字节高熵随机 hex；文件 0600 且属主 `agnestudio:agnestudio`；不得复制到 `/opt/agnes-video/`、日志、聊天或版本库；变更需在维护窗口重启 `agnesvideo` 才生效；更换后旧签名链接立即失效（预期行为）。**disposition 契约**：签名 URL 的 `disposition` 字段只允许 `inline`/`attachment` 且被 HMAC 绑定——`/playlink` 默认签发 inline（播放器），下载按钮签发 attachment；客户端篡改 `disposition` 参数即验签失败（invalid/malformed → 403），不得为"方便"把 disposition 改成未签名的自由参数；旧四字段（无 disposition）签名兼容但仅按 inline 生效；`/api/download` 的 Bearer 路径固定 inline，`disposition` 参数对其无效；启用步骤与无密验证方法见 `README_CN.md`「启用 AGNES_PLAY_SECRET」及「签名 URL 的 inline / attachment 契约」小节 |
 
 **禁止事项：**
-- 不得在任何文档、日志、聊天消息中记录令牌或 API Key 内容
+- 不得在任何文档、日志、聊天消息中记录令牌、API Key 或 `AGNES_PLAY_SECRET` 的内容
 - 不得通过剪贴板、截图等方式将令牌暴露给非授权应用
+- 不得为了"让签名播放链接可用"而关闭 `/api/download` 鉴权、把 Bearer 令牌写进 URL、或把 `AGNES_API_TOKEN` 复用为 `AGNES_PLAY_SECRET`
+
+**/api/download 的 GET / HEAD / Range 与 method 绑定：**
+- GET：无 Range → 200 完整正文；合法 `Range: bytes=…` → 206 + `Content-Range`；越界/无法满足 → 416；非法/多段/非 `bytes=` → 按 200 完整返回。
+- HEAD：仅元数据探测，**复用生产签发的 GET 签名**（`?method=GET` 的 playlink URL）；响应含完整资源头（`Content-Type`/`Accept-Ranges`/`Content-Length`=完整大小/`Content-Disposition`/`Referrer-Policy: no-referrer`），**不发送正文**，且**忽略请求中的 Range**。
+- 无"HEAD 专用签名"：签发端只签 `method=GET`，验证端强制签名 `method` 必须为 `GET`；`method=HEAD` 的签名对 GET 与 HEAD 一律 403，HEAD 签名绝不能执行 GET 下载，也不削弱 GET 方法绑定。
+- Bearer 路径固定 inline；未配置 `AGNES_PLAY_SECRET` 且无 Bearer 时 fail closed（403）。
+- `/api/download` 以外的 `/api/*` 路由 HEAD 仍返回 501。详见 `README_CN.md`「/api/download 的 GET / HEAD / Range 契约」小节。
 
 ## 六、更新部署规范
 
