@@ -43,7 +43,7 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         TextView note = new TextView(this);
-        note.setText("霓虹 AI 视频工作室\n\n本 APK 只会在手机浏览器打开 localhost:8090，\n不会自动启动 Termux 后端。\n\n请先在 Termux 手动启动工作室服务：\n1) 进入本仓库 backend/ 子目录（后端源代码所在位置）\n2) 按 backend 内现有启动说明（start.sh / README_CN.md）启动服务\n\n保持 Termux 服务运行，再点下方连接。");
+        note.setText("霓虹 AI 视频工作室\n\n本 APK 通过应用内页面连接本地服务，\n不会自动启动 Termux 后端。\n\n请先在 Termux 手动启动工作室服务：\n1) 进入本仓库 backend/ 子目录（后端源代码所在位置）\n2) 按 backend 内现有启动说明（start.sh / README_CN.md）启动服务\n\n保持 Termux 服务运行，再点下方连接。");
         note.setTextColor(Color.rgb(220, 228, 245));
         note.setTextSize(16);
         note.setGravity(Gravity.CENTER);
