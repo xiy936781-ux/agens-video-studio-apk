@@ -16,7 +16,7 @@ import android.widget.TextView;
 import android.widget.FrameLayout;
 
 public class MainActivity extends Activity {
-    private static final String LOCAL_URL = "http://127.0.0.1:8090";
+    private static final String LOCAL_URL = "http://127.0.0.1:18090";
     private WebView webView;
     private LinearLayout landing;
 
@@ -43,7 +43,7 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         TextView note = new TextView(this);
-        note.setText("霓虹 AI 视频工作室\n\n本 APK 通过应用内页面连接本地服务，\n不会自动启动 Termux 后端。\n\n请先在 Termux 手动启动工作室服务：\n1) 进入本仓库 backend/ 子目录（后端源代码所在位置）\n2) 按 backend 内现有启动说明（start.sh / README_CN.md）启动服务\n\n保持 Termux 服务运行，再点下方连接。");
+        note.setText("霓虹 AI 视频工作室\n\n本 APK 通过应用内页面连接云端 AgnesVideo，\n不会启动本地后端。\n\n请先在 Termux 手动启动 SSH 端口转发并保持该会话运行：\nssh -N -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes -L 18090:127.0.0.1:8090 root@210.126.238.200\n\n确认隧道运行后，再回到本应用点连接。\n（隧道将 127.0.0.1:18090 转发到云端 127.0.0.1:8090）");
         note.setTextColor(Color.rgb(220, 228, 245));
         note.setTextSize(16);
         note.setGravity(Gravity.CENTER);
@@ -75,7 +75,7 @@ public class MainActivity extends Activity {
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
                 String url = request.getUrl().toString();
-                return !url.startsWith("http://127.0.0.1:8090") && !url.startsWith("http://localhost:8090");
+                return !url.startsWith("http://127.0.0.1:18090") && !url.startsWith("http://localhost:18090");
             }
             @Override
             public void onReceivedError(WebView view, WebResourceRequest request,
