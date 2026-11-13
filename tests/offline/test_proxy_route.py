@@ -244,6 +244,14 @@ class NormalizeProgressTests(unittest.TestCase):
         r2 = SERVER.normalize({}, {"status": "processing", "progress": -5})
         self.assertEqual(r2["progress"], 0)
 
+    def test_large_positive_int_clamped_to_hundred(self):
+        r = SERVER.normalize({}, {"status": "processing", "progress": 10 ** 1000})
+        self.assertEqual(r["progress"], 100)
+
+    def test_large_negative_int_clamped_to_zero(self):
+        r = SERVER.normalize({}, {"status": "processing", "progress": -(10 ** 1000)})
+        self.assertEqual(r["progress"], 0)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

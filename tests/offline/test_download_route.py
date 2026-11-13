@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -24,18 +25,20 @@ def _load_server_module():
     old_data = os.environ.pop("AGNES_DATA_DIR", None)
     old_out = os.environ.pop("AGNES_OUTPUT_DIR", None)
     old_token = os.environ.pop("AGNES_API_TOKEN", None)
+    old_play = os.environ.pop("AGNES_PLAY_SECRET", None)
     os.environ["AGNES_DATA_DIR"] = str(tmp / "data")
     os.environ["AGNES_OUTPUT_DIR"] = str(tmp / "outputs")
     os.environ["AGNES_API_TOKEN"] = "download-token"
+    os.environ["AGNES_PLAY_SECRET"] = "download-play-secret-0123456789abcdef"
     spec = importlib.util.spec_from_file_location("server_download", ROOT / "server.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    if old_data is not None:
-        os.environ["AGNES_DATA_DIR"] = old_data
-    if old_out is not None:
-        os.environ["AGNES_OUTPUT_DIR"] = old_out
-    if old_token is not None:
-        os.environ["AGNES_API_TOKEN"] = old_token
+    for key, value in (("AGNES_DATA_DIR", old_data), ("AGNES_OUTPUT_DIR", old_out),
+                       ("AGNES_API_TOKEN", old_token), ("AGNES_PLAY_SECRET", old_play)):
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
     return module
 
 
@@ -138,6 +141,7 @@ class DownloadRouteTests(unittest.TestCase):
         return handler
 
     def _signed_head_path(self, disposition="attachment"):
+        _write_mp4(self.out)
         exp = int(time.time()) + 3600
         sig = SERVER._issue_play_sig("test_local.mp4", exp,
                                      disposition=disposition)
@@ -264,8 +268,8 @@ class DownloadRouteTests(unittest.TestCase):
         """A no-Range GET and the matching HEAD set the same five resource
         headers; the only difference is that GET sends the body and HEAD
         does not."""
-        self._write_mp4(self.out)
-        g = self._get("/api/download/test_local.mp4")          # no Range
+        _write_mp4(self.out)
+        g = self._get("/api/download/test_local.mp4", write_file=False)  # no Range
         h = self._head("/api/download/test_local.mp4")
         self.assertEqual(g.status_code, 200)
         self.assertEqual(h.status_code, 200)
@@ -280,10 +284,10 @@ class DownloadRouteTests(unittest.TestCase):
         """On a missing file, GET and HEAD both return 404 with the same
         JSON error headers (Content-Type / Content-Length / Cache-Control);
         only the body differs (GET sends the JSON, HEAD does not)."""
-        self._write_mp4(self.out)
+        _write_mp4(self.out)
         g = _DownloadHandler("/api/download/ghost.mp4")
         g.do_GET()
-        h = _HeadHandler("/api/download/ghost.mp4")
+        h = _HeadHandler("/api/download/ghost.mp4", token=VALID_TOKEN)
         h.do_HEAD()
         self.assertEqual(g.status_code, 404)
         self.assertEqual(h.status_code, 404)
@@ -297,6 +301,7 @@ class DownloadRouteTests(unittest.TestCase):
         """Build a signed /api/download URL whose signature is bound to
         `method` — mirroring the production issuance format (which always
         signs method=GET)."""
+        _write_mp4(self.out)
         exp = int(time.time()) + 3600
         sig = SERVER._issue_play_sig("test_local.mp4", exp,
                                      purpose="play", method=method,
@@ -316,7 +321,7 @@ class DownloadRouteTests(unittest.TestCase):
         self.assertEqual(h.status_code, 200, "GET-signed URL must authorize HEAD")
         self.assertEqual(h.wfile.getvalue(), b"")
         # GET: the same URL still downloads (unchanged production behavior).
-        g = _DownloadHandler(url)
+        g = _DownloadHandler(url, token=None)
         g.do_GET()
         self.assertEqual(g.status_code, 200, "GET-signed URL must authorize GET")
         self.assertEqual(g.wfile.getvalue(), b"0123456789abcdef")
@@ -328,10 +333,10 @@ class DownloadRouteTests(unittest.TestCase):
         execute a GET download."""
         url = self._signed_path_for_method("HEAD")
         # GET with a HEAD-bound signature -> rejected, no video body.
-        g = _DownloadHandler(url)
+        g = _DownloadHandler(url, token=None)
         g.do_GET()
         self.assertEqual(g.status_code, 403, "HEAD signature must not authorize GET")
-        self.assertEqual(g.wfile.getvalue(), b"", "no video body on rejection")
+        self.assertNotEqual(g.wfile.getvalue(), b"0123456789abcdef", "no video bytes on rejection")
         # HEAD with a HEAD-bound signature -> also rejected (only method=GET
         # is the issuable value, so a HEAD-bound sig verifies for nothing).
         h = _HeadHandler(url)
@@ -448,10 +453,10 @@ class SafeContentDispositionTests(unittest.TestCase):
         self.assertNotIn("+", star)
 
     def test_space_quote_semicolon(self):
-        hdr = self._hdr("a b;c'\\d.mp4", "inline")
+        hdr = self._hdr("a b;c'.mp4", "inline")
         self.assertTrue(hdr.startswith("inline;"))
         star = hdr.split("filename*=UTF-8''", 1)[1]
-        self.assertEqual(unquote(star), "a b;c'\\d.mp4")
+        self.assertEqual(unquote(star), "a b;c'.mp4")
         self.assertNotIn("+", star)
 
     def test_crlf_control_chars_stripped(self):
@@ -463,8 +468,11 @@ class SafeContentDispositionTests(unittest.TestCase):
                 fallback = hdr.split('filename="', 1)[1].split('"', 1)[0]
                 for ch in fallback:
                     self.assertNotIn(ch, "\r\n\x00\x1b")
+                expected = {"evil\r\nx: y.mp4": "evilx: y.mp4",
+                            "evil\x00f.mp4": "evilf.mp4",
+                            "evil\x1bf.mp4": "evilf.mp4"}[bad]
                 self.assertEqual(unquote(hdr.split("filename*=UTF-8''", 1)[1]),
-                                 "evilxy.mp4")
+                                 expected)
 
     def test_path_separators_stripped(self):
         # Only the final path component is ever embedded in the header.

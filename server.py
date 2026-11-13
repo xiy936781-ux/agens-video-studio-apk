@@ -694,7 +694,9 @@ def _verify_play_signature(basename: str, purpose: str, method: str, exp_str: st
     payload4 = ("%s|%s|%s|%d" % (purpose, basename, method, exp_int)).encode("utf-8")
     expected4 = base64.urlsafe_b64encode(
         hmac.new(key, payload4, hashlib.sha256).digest()).rstrip(b"=").decode("ascii")
-    if hmac.compare_digest(expected4, sig):
+    # Legacy signatures are valid only for inline requests. Reject an
+    # explicit attachment request: that disposition was never signed.
+    if disp == "inline" and hmac.compare_digest(expected4, sig):
         return (True, None, "inline")
     return (False, "invalid", "inline")
 
@@ -834,13 +836,13 @@ def _sanitize_progress_int(value, default=0):
         return default
     if isinstance(value, bool):
         return 100 if value else 0
-    if isinstance(value, (int, float)):
+    if isinstance(value, int):
+        # Arbitrary-precision int: clamp directly without float conversion.
+        return max(0, min(100, value))
+    try:
         number = float(value)
-    else:
-        try:
-            number = float(value)
-        except (TypeError, ValueError):
-            return value
+    except (TypeError, ValueError):
+        return value
     if number != number:  # NaN
         number = 0.0
     elif number == float("inf"):

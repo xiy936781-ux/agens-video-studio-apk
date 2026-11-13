@@ -582,7 +582,6 @@ class PlaylinkRouteTests(_PlayLinkBase):
         self._write_merged()
         self._seed_job("lvx", merged_file="merged_lvx.mp4")
         h = self._run_playlink("/api/jobs/lvx/playlink")
-        h.do_GET()
         self.assertEqual(h.status_code, 200)
         body = h.body_json()
         self.assertIn("url", body)
@@ -615,7 +614,6 @@ class PlaylinkRouteTests(_PlayLinkBase):
         self._write_merged()
         self._seed_job("lvx", merged_file="merged_lvx.mp4")
         h = self._run_playlink("/api/jobs/lvx/playlink?disposition=attachment")
-        h.do_GET()
         self.assertEqual(h.status_code, 200)
         body = h.body_json()
         self.assertEqual(body["disposition"], "attachment")
@@ -638,7 +636,6 @@ class PlaylinkRouteTests(_PlayLinkBase):
         self._seed_job("lvx", merged_file="merged_lvx.mp4")
         with patch.object(SERVER, "PLAY_SECRET", ""):
             h = self._run_playlink("/api/jobs/lvx/playlink")
-            h.do_GET()
         self.assertEqual(h.status_code, 503)
 
     def test_playlink_not_shadowed_by_generic_jobs_route(self):
@@ -647,7 +644,6 @@ class PlaylinkRouteTests(_PlayLinkBase):
         self._write_merged()
         self._seed_job("lvx", merged_file="merged_lvx.mp4")
         h = self._run_playlink("/api/jobs/lvx/playlink")
-        h.do_GET()
         self.assertEqual(h.status_code, 200, "playlink route was shadowed by generic /api/jobs/ block")
 
 
